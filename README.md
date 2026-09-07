@@ -1,9 +1,17 @@
-# VCN Media Worker — v0.2
+# VCN Media Worker — v0.3
 
-Controlled Railway/FFmpeg infrastructure test.
+This version fixes the first controlled render test by removing the
+`showwaves + overlay` filter chain that stalled in v0.2.
 
-- `GET /health` checks FFmpeg.
-- `POST /render-test` generates one synthetic 10-second 1920x1080 H.264/AAC MP4.
-- `GET /render-test.mp4` downloads the generated test.
+The test now focuses on the infrastructure proof:
 
-No VCN production data, Musicful calls, wallets, bonuses, database writes, karaoke, or permanent storage are involved.
+- 1920×1080
+- 30 fps
+- H.264 / libx264
+- AAC stereo
+- genuine MP4
+- 10 seconds
+- basic VCN text/graphics
+
+No VCN production connection, Musicful calls, member data, wallets,
+bonuses, karaoke, or permanent storage are involved.

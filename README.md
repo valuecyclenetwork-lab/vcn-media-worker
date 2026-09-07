@@ -1,10 +1,9 @@
-# VCN Media Worker — Starter
+# VCN Media Worker — v0.2
 
-This starter exists only to prove that Railway can run the VCN media worker container and execute FFmpeg.
+Controlled Railway/FFmpeg infrastructure test.
 
-## Endpoints
-- `GET /` — worker status
-- `GET /health` — verifies FFmpeg is available
+- `GET /health` checks FFmpeg.
+- `POST /render-test` generates one synthetic 10-second 1920x1080 H.264/AAC MP4.
+- `GET /render-test.mp4` downloads the generated test.
 
-## Important
-This version does not connect to VCN production data and does not render member videos yet.
+No VCN production data, Musicful calls, wallets, bonuses, database writes, karaoke, or permanent storage are involved.

@@ -1,17 +1,7 @@
-# VCN Media Worker — v0.3
+# VCN Media Worker — v0.3.1 Diagnostic
 
-This version fixes the first controlled render test by removing the
-`showwaves + overlay` filter chain that stalled in v0.2.
+Diagnostic build to identify why the 1080p FFmpeg render exits early.
 
-The test now focuses on the infrastructure proof:
+It reports FFmpeg return code, partial file existence and size, ffprobe output where possible, and the final stderr lines. It also limits encoding to 2 threads for a cleaner infrastructure test.
 
-- 1920×1080
-- 30 fps
-- H.264 / libx264
-- AAC stereo
-- genuine MP4
-- 10 seconds
-- basic VCN text/graphics
-
-No VCN production connection, Musicful calls, member data, wallets,
-bonuses, karaoke, or permanent storage are involved.
+No VCN production data, Musicful calls, member balances, bonuses, allocations, karaoke, or permanent storage are touched.

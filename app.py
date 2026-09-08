@@ -3,8 +3,10 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import JSONResponse, FileResponse
 from PIL import Image, ImageStat
+from render_music_video import router as music_video_router
 
 app = FastAPI(title="VCN Media Worker", version="0.6.0")
+app.include_router(music_video_router)
 WORK_DIR = Path("/tmp/vcn-media"); WORK_DIR.mkdir(parents=True, exist_ok=True)
 ASSET_DIR = Path("/app/assets")
 LOGO_LIGHT = ASSET_DIR / "vcn-logo-light-bg.png"

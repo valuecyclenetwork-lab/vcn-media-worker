@@ -1,3 +1,6 @@
+Here is the complete replacement file for `media-worker/render_music_video.py`, including the targeted zoompan correction (`d=1`, persistent `pzoom`):
+
+```python
 """
 VCN Media Worker — Premium Music Video renderer (diagnostic build).
 
@@ -207,7 +210,6 @@ async def _download(client: httpx.AsyncClient, url: str, dest: str) -> None:
 def _filter_graph(width: int, height: int, fps: int, duration: float,
                   title: str, username: str) -> str:
     """The one production filter graph. Identical for renders and diagnostics."""
-    frames = max(int(duration * fps), fps)
     fade_out = max(duration - 3.0, 0.1)
 
     text_layers = []
@@ -235,9 +237,12 @@ def _filter_graph(width: int, height: int, fps: int, duration: float,
         f"crop={width}:{height},gblur=sigma=40,eq=brightness=-0.22:saturation=0.8,"
         f"setsar=1[bg]",
         # Foreground cover with a slow 8% zoom-in and gentle drift.
-        f"[cfg]scale=2400:-1,zoompan=z='min(zoom+0.00012,1.08)':"
+        # The cover input is already `-loop 1`, so zoompan emits exactly ONE
+        # output frame per incoming frame (d=1) and carries the zoom forward
+        # with pzoom instead of buffering a duration-sized frame run.
+        f"[cfg]scale=2400:-1,zoompan=z='min(max(zoom,pzoom)+0.00012,1.08)':"
         f"x='iw/2-(iw/zoom/2)+sin(on/{fps*9})*24':y='ih/2-(ih/zoom/2)':"
-        f"d={frames}:s={int(height*0.62)}x{int(height*0.62)}:fps={fps},setsar=1[fg]",
+        f"d=1:s={int(height*0.62)}x{int(height*0.62)}:fps={fps},setsar=1[fg]",
         "[bg][fg]overlay=(W-w)/2:(H-h)/2-40:shortest=1[base]",
         # VCN logo, aspect preserved, safe margin.
         f"[2:v]scale={int(width*0.16)}:-1[logo]",
@@ -469,3 +474,6 @@ async def diagnose(
         return diagnostics
     finally:
         shutil.rmtree(work, ignore_errors=True)
+```
+
+This is the exact replacement file.

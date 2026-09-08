@@ -32,7 +32,30 @@ router = APIRouter()
 SECRET = os.environ.get("VCN_MEDIA_WORKER_SECRET", "")
 LOGO_LIGHT = os.environ.get("VCN_LOGO_LIGHT", "assets/vcn-logo-light.png")
 LOGO_DARK = os.environ.get("VCN_LOGO_DARK", "assets/vcn-logo.png")
-FONT = os.environ.get("VCN_FONT", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
+def _pick_font() -> str:
+    """First usable bold sans font on this image; drawtext dies without one."""
+    candidates = [
+        os.environ.get("VCN_FONT", ""),
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path) and "[" not in path and ":" not in path:
+            return path
+    for root in ("/usr/share/fonts", "/app/assets"):
+        for base, _dirs, files in os.walk(root):
+            for name in sorted(files):
+                if name.lower().endswith((".ttf", ".otf")):
+                    full = os.path.join(base, name)
+                    if "[" not in full and ":" not in full:
+                        return full
+    return ""
+
+
+FONT = _pick_font()
 MAX_SKEW = 900
 
 JOBS: Dict[str, Dict[str, Any]] = {}
@@ -106,28 +129,43 @@ def _render(audio: str, cover: str, out: str, title: str, username: str,
     frames = max(int(duration * fps), fps)
     fade_out = max(duration - 3.0, 0.1)
 
+    text_layers = []
+    if FONT:
+        text_layers = [
+            f"drawtext=fontfile='{FONT}':text='{_esc(title)}':"
+            f"x=(w-text_w)/2:y=h-{int(height*0.16)}:fontsize={int(height*0.058)}:"
+            f"fontcolor=white:shadowcolor=black@0.6:shadowx=2:shadowy=2:"
+            f"alpha='if(lt(t,0.8),t/0.8,1)'",
+            f"drawtext=fontfile='{FONT}':text='{_esc(username)}':"
+            f"x=(w-text_w)/2:y=h-{int(height*0.095)}:fontsize={int(height*0.032)}:"
+            f"fontcolor=white@0.85:shadowcolor=black@0.6:shadowx=2:shadowy=2:"
+            f"alpha='if(lt(t,1.2),max(t-0.4,0)/0.8,1)'",
+        ]
+    final_chain = ",".join(
+        text_layers + [f"fade=t=in:st=0:d=1.2,fade=t=out:st={fade_out:.2f}:d=3"]
+    )
+
     filters = [
-        f"[1:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
+        # One decode of the cover, explicitly split: some FFmpeg builds refuse
+        # to reuse the same input pad twice in one graph.
+        "[1:v]split=2[cbg][cfg]",
+        # Blurred, darkened background bed built from the same cover.
+        f"[cbg]scale={width}:{height}:force_original_aspect_ratio=increase,"
         f"crop={width}:{height},gblur=sigma=40,eq=brightness=-0.22:saturation=0.8,"
         f"setsar=1[bg]",
-        f"[1:v]scale=2400:-1,zoompan=z='min(zoom+0.00012,1.08)':"
+        # Foreground cover with a slow 8% zoom-in and gentle drift.
+        f"[cfg]scale=2400:-1,zoompan=z='min(zoom+0.00012,1.08)':"
         f"x='iw/2-(iw/zoom/2)+sin(on/{fps*9})*24':y='ih/2-(ih/zoom/2)':"
         f"d={frames}:s={int(height*0.62)}x{int(height*0.62)}:fps={fps},setsar=1[fg]",
         "[bg][fg]overlay=(W-w)/2:(H-h)/2-40:shortest=1[base]",
+        # VCN logo, aspect preserved, safe margin.
         f"[2:v]scale={int(width*0.16)}:-1[logo]",
         f"[base][logo]overlay=W-w-{int(width*0.035)}:{int(height*0.05)}[branded]",
-        f"[branded]drawtext=fontfile={FONT}:text='{_esc(title)}':"
-        f"x=(w-text_w)/2:y=h-{int(height*0.16)}:fontsize={int(height*0.058)}:"
-        f"fontcolor=white:shadowcolor=black@0.6:shadowx=2:shadowy=2:"
-        f"alpha='if(lt(t,0.8),t/0.8,1)',"
-        f"drawtext=fontfile={FONT}:text='{_esc(username)}':"
-        f"x=(w-text_w)/2:y=h-{int(height*0.095)}:fontsize={int(height*0.032)}:"
-        f"fontcolor=white@0.85:shadowcolor=black@0.6:shadowx=2:shadowy=2:"
-        f"alpha='if(lt(t,1.2),max(t-0.4,0)/0.8,1)',"
-        f"fade=t=in:st=0:d=1.2,fade=t=out:st={fade_out:.2f}:d=3[v]",
+        # Title + exact creator username, faded in over the intro.
+        f"[branded]{final_chain}[v]",
     ]
 
-    subprocess.run(
+    proc = subprocess.run(
         ["ffmpeg", "-y",
          "-i", audio, "-loop", "1", "-i", cover, "-i", logo,
          "-filter_complex", ";".join(filters),
@@ -136,8 +174,11 @@ def _render(audio: str, cover: str, out: str, title: str, username: str,
          "-pix_fmt", "yuv420p", "-r", str(fps),
          "-c:a", "aac", "-b:a", "192k", "-ac", "2",
          "-t", f"{duration:.3f}", "-shortest", "-movflags", "+faststart", out],
-        check=True, capture_output=True,
+        capture_output=True,
     )
+    if proc.returncode != 0:
+        tail = (proc.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        raise RuntimeError("ffmpeg failed: " + " | ".join(tail[-4:]))
 
 
 async def _run_job(render_job_id: str, body: Dict[str, Any]) -> None:
@@ -179,7 +220,7 @@ async def _run_job(render_job_id: str, body: Dict[str, Any]) -> None:
                 "height": int(body.get("height", 1080)),
                 "file_size": size,
             })
-    except Exception as exc:  # any failure must refund the member
+    except Exception as exc:  # noqa: BLE001 — any failure must refund the member
         JOBS[render_job_id] = {"status": "FAILED", "error": str(exc)[:400]}
         try:
             async with httpx.AsyncClient() as client:
@@ -189,7 +230,7 @@ async def _run_job(render_job_id: str, body: Dict[str, Any]) -> None:
                     "status": "FAILED",
                     "error": str(exc)[:400],
                 })
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
     finally:
         shutil.rmtree(work, ignore_errors=True)

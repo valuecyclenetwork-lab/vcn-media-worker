@@ -1,5 +1,5 @@
 """
-VCN Media Worker — Premium Music Video renderer.
+VCN Media Worker — Premium Music Video renderer (diagnostic build).
 
 Drop this file next to the existing worker app and mount it:
 
@@ -8,6 +8,15 @@ Drop this file next to the existing worker app and mount it:
 
 Requires: ffmpeg + ffprobe on PATH (already present in the Railway image),
 fastapi, httpx. Set VCN_MEDIA_WORKER_SECRET to the same value held by VCN.
+
+This build does NOT change the render recipe. It only:
+  * captures full FFmpeg diagnostics on failure (sanitised command, return
+    code, last 150 stderr lines, matched error lines, input probes, font,
+    logo, temp-file sizes);
+  * adds a signed POST /v1/diagnose endpoint that runs the EXACT production
+    filter graph for the first 10 seconds only and returns the diagnostics
+    synchronously (no storage upload, no callback).
+Secrets, signatures and signed storage URLs are never emitted.
 """
 
 from __future__ import annotations
@@ -17,12 +26,13 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import time
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import APIRouter, Header, HTTPException, Request
@@ -32,6 +42,8 @@ router = APIRouter()
 SECRET = os.environ.get("VCN_MEDIA_WORKER_SECRET", "")
 LOGO_LIGHT = os.environ.get("VCN_LOGO_LIGHT", "assets/vcn-logo-light.png")
 LOGO_DARK = os.environ.get("VCN_LOGO_DARK", "assets/vcn-logo.png")
+
+
 def _pick_font() -> str:
     """First usable bold sans font on this image; drawtext dies without one."""
     candidates = [
@@ -60,6 +72,14 @@ MAX_SKEW = 900
 
 JOBS: Dict[str, Dict[str, Any]] = {}
 
+# Last failure diagnostics, keyed by render job id (in-memory, no secrets).
+DIAGNOSTICS: Dict[str, Dict[str, Any]] = {}
+
+ERROR_PATTERNS = re.compile(
+    r"Error|error|Invalid|Failed|failed|Cannot|No such|filter|encoder|decoder|"
+    r"drawtext|overlay|scale|split|Conversion|Killed|memory|Out of"
+)
+
 
 # ----------------------------------------------------------------- security
 def _sign(timestamp: str, raw: str) -> str:
@@ -83,6 +103,67 @@ async def _verified_body(request: Request, timestamp: Optional[str], signature: 
     if not hmac.compare_digest(_sign(timestamp, raw), signature.strip().lower()):
         raise HTTPException(status_code=401, detail="Bad signature")
     return json.loads(raw or "{}")
+
+
+# -------------------------------------------------------------- diagnostics
+def _redact(text: str) -> str:
+    """Strips anything that could carry a secret, token or signed URL."""
+    out = str(text or "")
+    out = re.sub(r"https?://\S+", "[redacted-url]", out)
+    if SECRET:
+        out = out.replace(SECRET, "[redacted-secret]")
+    out = re.sub(r"(?i)(token|signature|apikey|api_key|secret)=\S+", r"\1=[redacted]", out)
+    return out
+
+
+def _safe_command(cmd: List[str]) -> List[str]:
+    return [_redact(part) for part in cmd]
+
+
+def _probe(path: str) -> Dict[str, Any]:
+    """Full ffprobe summary of a local input file. Never raises."""
+    info: Dict[str, Any] = {
+        "path": os.path.basename(path),
+        "exists": os.path.isfile(path),
+        "size_bytes": os.path.getsize(path) if os.path.isfile(path) else 0,
+    }
+    if not info["exists"]:
+        return info
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-print_format", "json",
+             "-show_format", "-show_streams", path],
+            capture_output=True, text=True, timeout=60,
+        )
+        parsed = json.loads(out.stdout or "{}")
+        fmt = parsed.get("format", {}) or {}
+        info["format_name"] = fmt.get("format_name")
+        info["duration"] = fmt.get("duration")
+        info["streams"] = [
+            {
+                "codec_name": s.get("codec_name"),
+                "codec_type": s.get("codec_type"),
+                "width": s.get("width"),
+                "height": s.get("height"),
+                "pix_fmt": s.get("pix_fmt"),
+                "sample_rate": s.get("sample_rate"),
+                "channels": s.get("channels"),
+            }
+            for s in (parsed.get("streams") or [])
+        ]
+    except Exception as exc:  # noqa: BLE001
+        info["probe_error"] = _redact(str(exc))[:300]
+    return info
+
+
+def _stderr_report(stderr: str) -> Dict[str, Any]:
+    lines = [ln.rstrip() for ln in (stderr or "").splitlines() if ln.strip()]
+    matched = [ln for ln in lines if ERROR_PATTERNS.search(ln)]
+    return {
+        "stderr_line_count": len(lines),
+        "stderr_tail_150": [_redact(ln) for ln in lines[-150:]],
+        "matched_error_lines": [_redact(ln) for ln in matched[-80:]],
+    }
 
 
 # -------------------------------------------------------------------- media
@@ -123,9 +204,9 @@ async def _download(client: httpx.AsyncClient, url: str, dest: str) -> None:
                 fh.write(chunk)
 
 
-def _render(audio: str, cover: str, out: str, title: str, username: str,
-            width: int, height: int, fps: int, duration: float, logo: str) -> None:
-    """Cinematic cover presentation: blurred bed + slow Ken Burns + branding."""
+def _filter_graph(width: int, height: int, fps: int, duration: float,
+                  title: str, username: str) -> str:
+    """The one production filter graph. Identical for renders and diagnostics."""
     frames = max(int(duration * fps), fps)
     fade_out = max(duration - 3.0, 0.1)
 
@@ -164,41 +245,90 @@ def _render(audio: str, cover: str, out: str, title: str, username: str,
         # Title + exact creator username, faded in over the intro.
         f"[branded]{final_chain}[v]",
     ]
+    return ";".join(filters)
 
-    proc = subprocess.run(
-        ["ffmpeg", "-y",
-         "-i", audio, "-loop", "1", "-i", cover, "-i", logo,
-         "-filter_complex", ";".join(filters),
-         "-map", "[v]", "-map", "0:a",
-         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-         "-pix_fmt", "yuv420p", "-r", str(fps),
-         "-c:a", "aac", "-b:a", "192k", "-ac", "2",
-         "-t", f"{duration:.3f}", "-shortest", "-movflags", "+faststart", out],
-        capture_output=True,
-    )
+
+def _render(audio: str, cover: str, out: str, title: str, username: str,
+            width: int, height: int, fps: int, duration: float, logo: str,
+            diagnostics: Optional[Dict[str, Any]] = None) -> None:
+    """Cinematic cover presentation: blurred bed + slow Ken Burns + branding."""
+    graph = _filter_graph(width, height, fps, duration, title, username)
+
+    cmd = ["ffmpeg", "-y",
+           "-i", audio, "-loop", "1", "-i", cover, "-i", logo,
+           "-filter_complex", graph,
+           "-map", "[v]", "-map", "0:a",
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+           "-pix_fmt", "yuv420p", "-r", str(fps),
+           "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+           "-t", f"{duration:.3f}", "-shortest", "-movflags", "+faststart", out]
+
+    if diagnostics is not None:
+        diagnostics.update({
+            "ffmpeg_command": _safe_command(cmd),
+            "filter_graph": graph,
+            "font_path": FONT or "(none — text overlay skipped)",
+            "logo_path": logo,
+            "logo_exists": os.path.isfile(logo),
+            "logo_size_bytes": os.path.getsize(logo) if os.path.isfile(logo) else 0,
+            "audio_probe": _probe(audio),
+            "cover_probe": _probe(cover),
+            "requested_duration": round(duration, 3),
+            "resolution": f"{width}x{height}",
+            "fps": fps,
+        })
+
+    started = time.time()
+    proc = subprocess.run(cmd, capture_output=True)
+    stderr = (proc.stderr or b"").decode("utf-8", "replace")
+    elapsed = round(time.time() - started, 2)
+
+    if diagnostics is not None:
+        diagnostics.update({
+            "return_code": proc.returncode,
+            "elapsed_seconds": elapsed,
+            "killed_by_signal": proc.returncode < 0,
+            "output_exists": os.path.isfile(out),
+            "output_size_bytes": os.path.getsize(out) if os.path.isfile(out) else 0,
+            **_stderr_report(stderr),
+        })
+
     if proc.returncode != 0:
-        tail = (proc.stderr or b"").decode("utf-8", "replace").strip().splitlines()
-        raise RuntimeError("ffmpeg failed: " + " | ".join(tail[-4:]))
+        report = _stderr_report(stderr)
+        fatal = report["matched_error_lines"][-4:] or report["stderr_tail_150"][-4:]
+        signal_note = (
+            f" (process killed by signal {-proc.returncode}; likely out of memory"
+            f" or a container limit)" if proc.returncode < 0 else ""
+        )
+        raise RuntimeError(
+            f"ffmpeg failed rc={proc.returncode}{signal_note}: " + " | ".join(fatal)
+        )
+
+
+async def _prepare_inputs(client: httpx.AsyncClient, body: Dict[str, Any], work: str):
+    audio = os.path.join(work, "a.mp3")
+    cover = os.path.join(work, "c.jpg")
+    await _download(client, body["audio_url"], audio)
+    await _download(client, body["cover_url"], cover)
+    logo = LOGO_LIGHT if _mean_luma(cover) < 110 else LOGO_DARK
+    return audio, cover, logo
 
 
 async def _run_job(render_job_id: str, body: Dict[str, Any]) -> None:
     work = tempfile.mkdtemp(prefix="vcn-pmv-")
-    audio, cover = os.path.join(work, "a.mp3"), os.path.join(work, "c.jpg")
     out = os.path.join(work, "out.mp4")
+    diagnostics: Dict[str, Any] = {"render_job_id": render_job_id}
     try:
         async with httpx.AsyncClient() as client:
-            await _download(client, body["audio_url"], audio)
-            await _download(client, body["cover_url"], cover)
-
+            audio, cover, logo = await _prepare_inputs(client, body, work)
             duration = _probe_duration(audio)  # full song, never hardcoded
-            logo = LOGO_LIGHT if _mean_luma(cover) < 110 else LOGO_DARK
 
             await asyncio.to_thread(
                 _render, audio, cover, out,
                 body.get("title") or "Untitled",
                 body.get("creator_username") or "",
                 int(body.get("width", 1920)), int(body.get("height", 1080)),
-                int(body.get("fps", 30)), duration, logo,
+                int(body.get("fps", 30)), duration, logo, diagnostics,
             )
 
             size = os.path.getsize(out)
@@ -221,14 +351,16 @@ async def _run_job(render_job_id: str, body: Dict[str, Any]) -> None:
                 "file_size": size,
             })
     except Exception as exc:  # noqa: BLE001 — any failure must refund the member
-        JOBS[render_job_id] = {"status": "FAILED", "error": str(exc)[:400]}
+        diagnostics["exception"] = _redact(str(exc))[:600]
+        DIAGNOSTICS[render_job_id] = diagnostics
+        JOBS[render_job_id] = {"status": "FAILED", "error": _redact(str(exc))[:400]}
         try:
             async with httpx.AsyncClient() as client:
                 await _callback(client, body, {
                     "job_id": body.get("job_id"),
                     "callback_token": body.get("callback_token"),
                     "status": "FAILED",
-                    "error": str(exc)[:400],
+                    "error": _redact(str(exc))[:400],
                 })
         except Exception:  # noqa: BLE001
             pass
@@ -280,3 +412,60 @@ async def job_status(
     if not job:
         return {"status": "UNKNOWN"}
     return {"status": job.get("status", "PROCESSING"), "error": job.get("error", "")}
+
+
+@router.post("/v1/job-diagnostics")
+async def job_diagnostics(
+    request: Request,
+    x_vcn_timestamp: Optional[str] = Header(None),
+    x_vcn_signature: Optional[str] = Header(None),
+):
+    """Sanitised diagnostics for a previously failed production render."""
+    body = await _verified_body(request, x_vcn_timestamp, x_vcn_signature)
+    return DIAGNOSTICS.get(str(body.get("render_job_id", "")), {"status": "UNKNOWN"})
+
+
+@router.post("/v1/diagnose")
+async def diagnose(
+    request: Request,
+    x_vcn_timestamp: Optional[str] = Header(None),
+    x_vcn_signature: Optional[str] = Header(None),
+):
+    """
+    Signed diagnostic render: EXACT production filter graph, same inputs, same
+    1080p/30 H.264 + AAC settings, but only the first 10 seconds. Nothing is
+    uploaded and no callback is sent — the sanitised diagnostics come straight
+    back in the response.
+    """
+    body = await _verified_body(request, x_vcn_timestamp, x_vcn_signature)
+    for field in ("audio_url", "cover_url"):
+        if not body.get(field):
+            raise HTTPException(status_code=400, detail=f"Missing {field}")
+
+    seconds = min(max(float(body.get("seconds", 10)), 1.0), 30.0)
+    work = tempfile.mkdtemp(prefix="vcn-diag-")
+    out = os.path.join(work, "diag.mp4")
+    diagnostics: Dict[str, Any] = {"mode": "diagnostic", "seconds": seconds}
+    try:
+        async with httpx.AsyncClient() as client:
+            audio, cover, logo = await _prepare_inputs(client, body, work)
+            diagnostics["source_audio_duration"] = round(_probe_duration(audio), 3)
+            try:
+                await asyncio.to_thread(
+                    _render, audio, cover, out,
+                    body.get("title") or "Untitled",
+                    body.get("creator_username") or "",
+                    int(body.get("width", 1920)), int(body.get("height", 1080)),
+                    int(body.get("fps", 30)), seconds, logo, diagnostics,
+                )
+                diagnostics["result"] = "OK"
+            except Exception as exc:  # noqa: BLE001
+                diagnostics["result"] = "FFMPEG_FAILED"
+                diagnostics["exception"] = _redact(str(exc))[:600]
+        return diagnostics
+    except Exception as exc:  # noqa: BLE001
+        diagnostics["result"] = "SETUP_FAILED"
+        diagnostics["exception"] = _redact(str(exc))[:600]
+        return diagnostics
+    finally:
+        shutil.rmtree(work, ignore_errors=True)

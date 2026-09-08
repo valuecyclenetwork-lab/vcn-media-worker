@@ -1,6 +1,3 @@
-Here is the complete replacement file for `media-worker/render_music_video.py`, including the targeted zoompan correction (`d=1`, persistent `pzoom`):
-
-```python
 """
 VCN Media Worker — Premium Music Video renderer (diagnostic build).
 
@@ -474,6 +471,4 @@ async def diagnose(
         return diagnostics
     finally:
         shutil.rmtree(work, ignore_errors=True)
-```
 
-This is the exact replacement file.

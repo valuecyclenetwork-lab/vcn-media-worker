@@ -14,7 +14,9 @@ ENV PYTHONUNBUFFERED=1 \
     HF_HOME=/models/hf \
     XDG_CACHE_HOME=/models/cache \
     KARAOKE_DEVICE=cpu \
-    KARAOKE_WHISPER_MODEL=small
+    KARAOKE_WHISPER_MODEL=small \
+    KARAOKE_ALIGN_V2_MODEL=medium \
+    KARAOKE_ALIGN_V2_SEPARATOR=dsp
 
 # Runtime dependencies only. PyAV is installed as a prebuilt wheel that bundles
 # its own FFmpeg libraries, so no libav*-dev headers and no C compilation are
@@ -56,9 +58,11 @@ dp.get_model("htdemucs")
 import whisperx
 whisperx.load_model("small", "cpu", compute_type="int8")
 whisperx.load_align_model(language_code="en", device="cpu")
+# align-v2 recognition model (isolated engine; align-v1 keeps using "small").
+whisperx.load_model("medium", "cpu", compute_type="int8")
 print("models baked")
 EOF
 
-COPY app.py .
+COPY app.py align_v2.py ./
 EXPOSE 8080
 CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8080} --workers 1"]

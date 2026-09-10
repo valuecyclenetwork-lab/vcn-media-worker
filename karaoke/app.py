@@ -72,7 +72,7 @@ FONT_CANDIDATES = [
 ]
 FONT_NAME = "DejaVu Sans"
 
-WORKER_VERSION = "2026-09-10.2-langfix"
+WORKER_VERSION = "2026-09-10.3-align"
 
 app = FastAPI(title="VCN Karaoke Worker")
 
@@ -661,11 +661,75 @@ async def _callback(client: httpx.AsyncClient, body: Dict[str, Any], payload: Di
     return False
 
 
+async def _align_only(kid: str, body: Dict[str, Any]) -> None:
+    """
+    SHARED ALIGNMENT CAPABILITY (additive, used by the VCN Full HD Lyrics Music
+    Video). Runs the SAME proven `_time_lyrics` forced alignment, but directly
+    on the ORIGINAL song audio: no Demucs, no instrumental, no rendering, no
+    Karaoke job and no Karaoke money. It returns timing JSON only.
+    """
+    work = tempfile.mkdtemp(prefix="vcna_")
+    diag: Dict[str, Any] = {"started_at": time.time(), "mode": "align_only"}
+    DIAGNOSTICS[kid] = diag
+    stage = "download"
+    _mark(diag, "job", "start")
+    try:
+        JOBS[kid] = {"status": "PROCESSING", "stage": stage}
+        src = os.path.join(work, "source.mp3")
+        async with httpx.AsyncClient() as client:
+            _mark(diag, stage, "start")
+            await _download(client, body["audio_url"], src)
+            _mark(diag, stage, "end")
+            duration = _probe_duration(src)
+
+            stage = "alignment"
+            JOBS[kid] = {"status": "PROCESSING", "stage": stage}
+            _mark(diag, stage, "start")
+            timing = await asyncio.to_thread(
+                _time_lyrics, src, body.get("lyrics") or "", body.get("language"), diag
+            )
+            _mark(diag, stage, "end")
+
+            JOBS[kid] = {"status": "COMPLETED", "stage": "done", "timings": _timings(diag)}
+            _mark(diag, "callback", "start")
+            await _callback(client, body, {
+                "job_id": body["job_id"],
+                "callback_token": body["callback_token"],
+                "kind": "ALIGNMENT",
+                "status": "COMPLETED",
+                "duration_seconds": round(duration, 3),
+                "timing": timing,
+                "timings": _timings(diag),
+            }, diag)
+            _mark(diag, "callback", "end")
+    except Exception as exc:  # noqa: BLE001
+        err = _redact(f"{stage}: {exc}")[:400]
+        JOBS[kid] = {"status": "FAILED", "stage": stage, "error": err}
+        log.error("alignment job %s failed at %s: %s", kid, stage, err)
+        try:
+            async with httpx.AsyncClient() as client:
+                await _callback(client, body, {
+                    "job_id": body.get("job_id"),
+                    "callback_token": body.get("callback_token"),
+                    "kind": "ALIGNMENT",
+                    "status": "FAILED",
+                    "error": err,
+                }, diag)
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        _mark(diag, "job", "end")
+        shutil.rmtree(work, ignore_errors=True)
+
+
 async def _worker_loop() -> None:
     while True:
         kid, body = await QUEUE.get()
         try:
-            await _process(kid, body)
+            if body.get("_kind") == "align":
+                await _align_only(kid, body)
+            else:
+                await _process(kid, body)
         finally:
             QUEUE.task_done()
 
@@ -700,11 +764,32 @@ async def render_karaoke(request: Request, x_vcn_timestamp: Optional[str] = Head
     return {"karaoke_job_id": kid, "status": "PENDING", "queue_position": QUEUE.qsize()}
 
 
+@app.post("/v1/align")
+async def align_lyrics(request: Request, x_vcn_timestamp: Optional[str] = Header(None),
+                       x_vcn_signature: Optional[str] = Header(None)) -> Dict[str, Any]:
+    """
+    Alignment-only entry point for the VCN Full HD Lyrics Music Video.
+    Same signed security, same queue, same proven alignment code — but no
+    Demucs, no render, no upload, no Karaoke job record.
+    """
+    body = await _verified_body(request, x_vcn_timestamp, x_vcn_signature)
+    for f in ("job_id", "audio_url", "callback_url", "callback_token"):
+        if not body.get(f):
+            raise HTTPException(status_code=400, detail=f"Missing {f}")
+    body["_kind"] = "align"
+    kid = f"aln_{uuid.uuid4().hex}"
+    JOBS[kid] = {"status": "PENDING", "stage": "queued", "position": QUEUE.qsize()}
+    await QUEUE.put((kid, body))
+    return {"align_job_id": kid, "karaoke_job_id": kid, "status": "PENDING",
+            "queue_position": QUEUE.qsize()}
+
+
 @app.post("/v1/job-status")
 async def job_status(request: Request, x_vcn_timestamp: Optional[str] = Header(None),
                      x_vcn_signature: Optional[str] = Header(None)) -> Dict[str, Any]:
     body = await _verified_body(request, x_vcn_timestamp, x_vcn_signature)
-    job = JOBS.get(str(body.get("karaoke_job_id", "")))
+    key = str(body.get("karaoke_job_id") or body.get("align_job_id") or "")
+    job = JOBS.get(key)
     if not job:
         raise HTTPException(status_code=404, detail="Unknown job")
     return job

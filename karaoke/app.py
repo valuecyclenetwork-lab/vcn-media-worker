@@ -37,9 +37,11 @@ Env:
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import shutil
@@ -48,6 +50,12 @@ import tempfile
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s vcn-karaoke %(message)s")
+log = logging.getLogger("vcn-karaoke")
+# httpx logs every request URL at INFO — that would print signed upload URLs. Keep it quiet.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -101,6 +109,55 @@ def _redact(text: str) -> str:
         out = out.replace(SECRET, "[redacted-secret]")
     out = re.sub(r"(?i)(token|signature|apikey|api_key|secret)=\S+", r"\1=[redacted]", out)
     return out
+
+
+# ---------------------------------------------------------------- language
+# Mirrors VCN's central `normalizeKaraokeLanguage` (src/lib/api/karaoke-language.ts).
+# Defensive: even if VCN ever sends a UI label again ("Auto Detect", "Igbo"),
+# WhisperX only ever receives a valid Whisper code or None (= auto-detect).
+AUTO_LANGUAGE_LABELS = {"", "auto", "auto detect", "auto-detect", "autodetect", "automatic",
+                        "detect", "any", "none", "unknown", "default", "null"}
+LANGUAGE_LABEL_TO_CODE = {
+    "english": "en", "yoruba": "yo", "hausa": "ha", "swahili": "sw", "amharic": "am",
+    "french": "fr", "spanish": "es", "portuguese": "pt", "arabic": "ar", "mandarin": "zh",
+    "chinese": "zh", "hindi": "hi", "japanese": "ja", "korean": "ko", "german": "de",
+    "italian": "it", "turkish": "tr", "dutch": "nl", "polish": "pl", "vietnamese": "vi",
+    "indonesian": "id",
+}
+WHISPER_LANGUAGE_CODES = set("""af am ar as az ba be bg bn bo br bs ca cs cy da de el en es et eu fa fi fo fr gl gu
+ha haw he hi hr ht hu hy id is it ja jw ka kk km kn ko la lb ln lo lt lv mg mi mk ml mn mr ms mt my ne nl nn no oc pa
+pl ps pt ro ru sa sd si sk sl sn so sq sr su sv sw ta te tg th tk tl tr tt uk ur uz vi yi yo yue zh""".split())
+
+
+def normalize_language_hint(value: Any) -> Tuple[Optional[str], str]:
+    """Returns (whisper_code_or_None, reason). Never raises."""
+    original = "" if value is None else str(value)
+    key = original.strip().lower()
+    if key in AUTO_LANGUAGE_LABELS:
+        return None, "auto"
+    mapped = LANGUAGE_LABEL_TO_CODE.get(key)
+    if mapped:
+        return mapped, "mapped"
+    if key in WHISPER_LANGUAGE_CODES:
+        return key, "code"
+    bare = re.split(r"[-_]", key)[0] if key else ""
+    if bare and bare != key and bare in WHISPER_LANGUAGE_CODES:
+        return bare, "code"
+    return None, "unsupported"
+
+
+def _now_iso() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _mark(diag: Dict[str, Any], stage: str, edge: str) -> None:
+    """Precise per-stage wall-clock stamps: diag["stages"][stage]["start"|"end"]."""
+    stages = diag.setdefault("stages", {})
+    entry = stages.setdefault(stage, {})
+    entry[edge] = _now_iso()
+    entry[f"{edge}_ts"] = round(time.time(), 3)
+    if edge == "end" and "start_ts" in entry:
+        entry["seconds"] = round(entry["end_ts"] - entry["start_ts"], 1)
 
 
 # ------------------------------------------------------------------ helpers
@@ -217,11 +274,25 @@ def _time_lyrics(vocals: str, lyrics: str, language_hint: Optional[str], diag: D
     source = "stored" if lines else "transcribed"
 
     # 1) language + rough segments from ASR (also gives text when no lyrics exist)
-    asr = MODELS["asr"].transcribe(audio, batch_size=8, language=(language_hint or None))
-    language = asr.get("language") or language_hint or "en"
+    #    Defensive: a UI label such as "Auto Detect" must never reach WhisperX.
+    hint, reason = normalize_language_hint(language_hint)
+    diag["language_hint_received"] = None if language_hint is None else str(language_hint)[:40]
+    diag["language_hint_used"] = hint
+    diag["language_hint_reason"] = reason
+    if reason in ("auto", "unsupported"):
+        log.info("language hint %r normalised to None (%s) → WhisperX auto-detect", diag["language_hint_received"], reason)
+    try:
+        asr = MODELS["asr"].transcribe(audio, batch_size=8, language=hint)
+    except ValueError as exc:
+        # Last line of defence: an unexpected language rejection falls back to auto-detect.
+        log.warning("WhisperX rejected language hint %r (%s); retrying with auto-detect", hint, _redact(str(exc))[:120])
+        diag["language_hint_fallback"] = _redact(str(exc))[:160]
+        asr = MODELS["asr"].transcribe(audio, batch_size=8, language=None)
+    language = asr.get("language") or hint or "en"
     segments = asr.get("segments") or []
     diag["asr_seconds"] = round(time.time() - t0, 1)
     diag["language"] = language
+    diag["language_detected"] = asr.get("language")
 
     if not lines:
         lines = [s["text"].strip() for s in segments if s.get("text", "").strip()]
@@ -360,16 +431,68 @@ def _render(work: str, cover: Optional[str], inst: str, ass: str, out_mp4: str,
     diag["render_seconds"] = round(time.time() - t0, 1)
 
 
+def _timings(diag: Dict[str, Any]) -> Dict[str, Any]:
+    """Everything VCN stores in karaoke_jobs.timings: per-stage seconds + exact ISO stamps."""
+    out = {k: v for k, v in diag.items() if k.endswith("_seconds")}
+    out["total_seconds"] = round(time.time() - diag["started_at"], 1)
+    out["stages"] = diag.get("stages", {})
+    for k in ("language_hint_received", "language_hint_used", "language_hint_reason", "language_detected"):
+        if k in diag:
+            out[k] = diag[k]
+    return out
+
+
+async def _preserve_stems(client: httpx.AsyncClient, body: Dict[str, Any], work: str,
+                          inst_wav: Optional[str], vocals_wav: Optional[str], diag: Dict[str, Any]) -> bool:
+    """
+    Diagnostic preservation (controlled tests): when a stage AFTER Demucs fails,
+    push the stems to VCN's PRIVATE storage (signed one-time upload URLs VCN
+    issued for this job) so the failure can be diagnosed without re-running
+    Demucs. VCN records the paths with an expiry and purges them; members never
+    see these files. Never raises.
+    """
+    if not (inst_wav and os.path.exists(inst_wav)):
+        return False
+    ok = False
+    try:
+        inst_mp3 = os.path.join(work, "instrumental.mp3")
+        if not os.path.exists(inst_mp3):
+            _run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", inst_wav,
+                  "-c:a", "libmp3lame", "-b:a", "192k", "-ac", "2", "-ar", "44100", inst_mp3], 600, "diag instrumental encode")
+        with open(inst_mp3, "rb") as fh:
+            r = await client.put(body["upload_instrumental_url"], content=fh.read(),
+                                 headers={"Content-Type": "audio/mpeg"}, timeout=600)
+        ok = r.status_code < 300
+        diag["diag_instrumental_upload"] = r.status_code
+        if vocals_wav and os.path.exists(vocals_wav) and body.get("upload_diag_vocals_url"):
+            voc_mp3 = os.path.join(work, "vocals.diag.mp3")
+            _run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", vocals_wav,
+                  "-c:a", "libmp3lame", "-b:a", "128k", "-ac", "2", "-ar", "44100", voc_mp3], 600, "diag vocals encode")
+            with open(voc_mp3, "rb") as fh:
+                r2 = await client.put(body["upload_diag_vocals_url"], content=fh.read(),
+                                      headers={"Content-Type": "audio/mpeg"}, timeout=600)
+            diag["diag_vocals_upload"] = r2.status_code
+        log.info("diagnostic stems preserved for job %s (instrumental=%s)", body.get("job_id"), ok)
+    except Exception as exc:  # noqa: BLE001
+        diag["diag_preserve_error"] = _redact(str(exc))[:200]
+        log.warning("could not preserve diagnostic stems: %s", diag["diag_preserve_error"])
+    return ok
+
+
 async def _process(kid: str, body: Dict[str, Any]) -> None:
     work = tempfile.mkdtemp(prefix="vcnk_")
     diag: Dict[str, Any] = {"started_at": time.time()}
     DIAGNOSTICS[kid] = diag
     stage = "download"
+    inst_wav: Optional[str] = None
+    vocals_wav: Optional[str] = None
+    _mark(diag, "job", "start")
     try:
         JOBS[kid] = {"status": "PROCESSING", "stage": stage}
         width = int(body.get("width", 1920)); height = int(body.get("height", 1080)); fps = int(body.get("fps", 30))
         src = os.path.join(work, "source.mp3")
         cover = os.path.join(work, "cover.img")
+        _mark(diag, stage, "start")
         async with httpx.AsyncClient() as client:
             await _download(client, body["audio_url"], src)
             if body.get("cover_url"):
@@ -381,30 +504,37 @@ async def _process(kid: str, body: Dict[str, Any]) -> None:
         if duration <= 1:
             raise RuntimeError("source audio unreadable")
         diag["source_duration"] = round(duration, 3)
+        _mark(diag, stage, "end")
 
-        stage = "vocal separation"; JOBS[kid]["stage"] = stage
+        stage = "vocal separation"; JOBS[kid]["stage"] = stage; _mark(diag, stage, "start")
         inst_wav, vocals_wav = await asyncio.to_thread(_separate, work, src, diag)
+        _mark(diag, stage, "end")
 
-        stage = "lyric alignment"; JOBS[kid]["stage"] = stage
+        stage = "lyric alignment"; JOBS[kid]["stage"] = stage; _mark(diag, stage, "start")
         timing = await asyncio.to_thread(_time_lyrics, vocals_wav, body.get("lyrics", ""), body.get("language_hint"), diag)
+        _mark(diag, stage, "end")
 
-        stage = "subtitles"; JOBS[kid]["stage"] = stage
+        stage = "subtitles"; JOBS[kid]["stage"] = stage; _mark(diag, stage, "start")
         ass = os.path.join(work, "lyrics.ass")
         _write_ass(ass, timing, body.get("title", ""), body.get("creator_username", ""), width, height)
+        _mark(diag, stage, "end")
+        diag["subtitles_seconds"] = diag["stages"][stage].get("seconds", 0)
 
-        stage = "instrumental encode"; JOBS[kid]["stage"] = stage
+        stage = "instrumental encode"; JOBS[kid]["stage"] = stage; _mark(diag, stage, "start")
         inst_mp3 = os.path.join(work, "instrumental.mp3")
         _run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", inst_wav,
               "-c:a", "libmp3lame", "-b:a", "192k", "-ac", "2", "-ar", "44100", inst_mp3], 600, stage)
+        _mark(diag, stage, "end")
 
-        stage = "karaoke video render"; JOBS[kid]["stage"] = stage
+        stage = "karaoke video render"; JOBS[kid]["stage"] = stage; _mark(diag, stage, "start")
         out_mp4 = os.path.join(work, "karaoke.mp4")
         await asyncio.to_thread(_render, work, cover, inst_mp3, ass, out_mp4, width, height, fps, duration, diag)
         size = os.path.getsize(out_mp4)
         if size < 100_000:
             raise RuntimeError("rendered file is suspiciously small")
+        _mark(diag, stage, "end")
 
-        stage = "upload"; JOBS[kid]["stage"] = stage
+        stage = "upload"; JOBS[kid]["stage"] = stage; _mark(diag, stage, "start")
         async with httpx.AsyncClient() as client:
             with open(out_mp4, "rb") as fh:
                 r = await client.put(body["upload_video_url"], content=fh.read(),
@@ -422,6 +552,7 @@ async def _process(kid: str, body: Dict[str, Any]) -> None:
                 has_sub = r3.status_code < 300
             except Exception:  # noqa: BLE001 — extras are optional
                 pass
+            _mark(diag, stage, "end")
 
             quality = {
                 "vocal_separation_model": DEMUCS_MODEL,
@@ -433,39 +564,99 @@ async def _process(kid: str, body: Dict[str, Any]) -> None:
                 "whisper_model": WHISPER_MODEL,
                 "device": DEVICE,
             }
-            timings = {k: v for k, v in diag.items() if k.endswith("_seconds")}
-            timings["total_seconds"] = round(time.time() - diag["started_at"], 1)
-            JOBS[kid] = {"status": "COMPLETED", "stage": "done"}
+            _mark(diag, "callback", "start")
+            timings = _timings(diag)
+            JOBS[kid] = {"status": "COMPLETED", "stage": "done", "timings": timings}
             await _callback(client, body, {
                 "job_id": body["job_id"], "callback_token": body["callback_token"],
                 "status": "COMPLETED", "duration_seconds": round(duration, 3),
                 "width": width, "height": height, "file_size": size,
                 "has_instrumental": has_inst, "has_subtitles": has_sub,
                 "quality": quality, "timings": timings,
-            })
+            }, diag)
+            _mark(diag, "callback", "end")
+            _mark(diag, "job", "end")
+            JOBS[kid]["timings"] = _timings(diag)
     except Exception as exc:  # noqa: BLE001 — any failure is reported, never charged
         err = _redact(str(exc))[:400]
         diag["exception"] = err
-        JOBS[kid] = {"status": "FAILED", "stage": stage, "error": err}
+        _mark(diag, stage, "end")
+        log.error("job %s FAILED at %s: %s", kid, stage, err)
+        preserved = False
         try:
             async with httpx.AsyncClient() as client:
+                if inst_wav and stage != "vocal separation":
+                    preserved = await _preserve_stems(client, body, work, inst_wav, vocals_wav, diag)
+                _mark(diag, "callback", "start")
+                timings = _timings(diag)
+                JOBS[kid] = {"status": "FAILED", "stage": stage, "error": err, "timings": timings,
+                             "diagnostics_preserved": preserved}
                 await _callback(client, body, {
                     "job_id": body.get("job_id"), "callback_token": body.get("callback_token"),
                     "status": "FAILED", "stage": stage, "error": err,
-                    "timings": {k: v for k, v in diag.items() if k.endswith("_seconds")},
-                })
-        except Exception:  # noqa: BLE001
-            pass
+                    "timings": timings, "diagnostics_preserved": preserved,
+                }, diag)
+                _mark(diag, "callback", "end")
+        except Exception as cb_exc:  # noqa: BLE001 — never hide it silently
+            diag["callback_fatal"] = _redact(str(cb_exc))[:200]
+            log.error("job %s failure callback could not be delivered: %s", kid, diag["callback_fatal"])
+            JOBS[kid] = {"status": "FAILED", "stage": stage, "error": err, "timings": _timings(diag),
+                         "callback_delivered": False}
     finally:
+        _mark(diag, "job", "end")
         shutil.rmtree(work, ignore_errors=True)
 
 
-async def _callback(client: httpx.AsyncClient, body: Dict[str, Any], payload: Dict[str, Any]) -> None:
-    raw = json.dumps(payload)
-    ts = str(int(time.time()))
-    await client.post(body["callback_url"], content=raw,
-                      headers={"Content-Type": "application/json", "X-VCN-Timestamp": ts,
-                               "X-VCN-Signature": _sign(ts, raw)}, timeout=60)
+CALLBACK_BACKOFF_SECONDS = (2, 5, 15, 30)  # bounded: 1 try + 4 retries
+
+
+async def _callback(client: httpx.AsyncClient, body: Dict[str, Any], payload: Dict[str, Any],
+                    diag: Optional[Dict[str, Any]] = None) -> bool:
+    """
+    Signed callback to VCN with bounded retries. Every attempt is logged with
+    timestamp, HTTP status and a safe response summary — never the secret,
+    signature or callback token. VCN's handler is idempotent, so a retry after a
+    slow-but-successful delivery cannot double-settle.
+    """
+    attempts: List[Dict[str, Any]] = []
+    if diag is not None:
+        diag["callback_attempts"] = attempts
+    total = len(CALLBACK_BACKOFF_SECONDS) + 1
+    for attempt in range(1, total + 1):
+        payload["callback_attempt"] = attempt
+        raw = json.dumps(payload)
+        ts = str(int(time.time()))
+        record: Dict[str, Any] = {"attempt": attempt, "at": _now_iso(), "status_key": payload.get("status")}
+        try:
+            r = await client.post(body["callback_url"], content=raw,
+                                  headers={"Content-Type": "application/json", "X-VCN-Timestamp": ts,
+                                           "X-VCN-Signature": _sign(ts, raw)}, timeout=60)
+            record["http"] = r.status_code
+            record["body"] = _redact(r.text or "")[:200]
+            # 2xx = settled/acknowledged. 4xx (except 408/429) = VCN rejected the
+            # payload/job deterministically; retrying cannot help. 5xx / 408 / 429 → retry.
+            if r.status_code < 300:
+                record["ok"] = True
+                attempts.append(record)
+                log.info("callback %s delivered on attempt %d/%d http=%d body=%s",
+                         payload.get("status"), attempt, total, r.status_code, record["body"])
+                return True
+            retryable = r.status_code >= 500 or r.status_code in (408, 429)
+            record["ok"] = False
+            attempts.append(record)
+            log.warning("callback %s attempt %d/%d rejected http=%d body=%s retry=%s",
+                        payload.get("status"), attempt, total, r.status_code, record["body"], retryable)
+            if not retryable:
+                return False
+        except Exception as exc:  # noqa: BLE001 — network / timeout
+            record["ok"] = False
+            record["error"] = _redact(f"{type(exc).__name__}: {exc}")[:200]
+            attempts.append(record)
+            log.warning("callback %s attempt %d/%d error=%s", payload.get("status"), attempt, total, record["error"])
+        if attempt <= len(CALLBACK_BACKOFF_SECONDS):
+            await asyncio.sleep(CALLBACK_BACKOFF_SECONDS[attempt - 1])
+    log.error("callback %s NOT delivered after %d attempts (job %s)", payload.get("status"), total, payload.get("job_id"))
+    return False
 
 
 async def _worker_loop() -> None:

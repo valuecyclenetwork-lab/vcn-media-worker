@@ -72,6 +72,8 @@ FONT_CANDIDATES = [
 ]
 FONT_NAME = "DejaVu Sans"
 
+WORKER_VERSION = "2026-09-10.2-langfix"
+
 app = FastAPI(title="VCN Karaoke Worker")
 
 JOBS: Dict[str, Dict[str, Any]] = {}
@@ -677,7 +679,7 @@ async def _startup() -> None:
 @app.get("/health")
 async def health() -> Dict[str, Any]:
     return {
-        "ok": True, "service": "vcn-karaoke-worker", "configured": bool(SECRET),
+        "ok": True, "service": "vcn-karaoke-worker", "version": WORKER_VERSION, "configured": bool(SECRET),
         "device": DEVICE, "whisper_model": WHISPER_MODEL, "demucs_model": DEMUCS_MODEL,
         "font": bool(_font()), "queue": QUEUE.qsize(),
         "ffmpeg": shutil.which("ffmpeg") is not None,

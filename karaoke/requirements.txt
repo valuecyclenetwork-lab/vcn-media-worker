@@ -4,4 +4,12 @@ httpx==0.27.*
 torch==2.3.1
 torchaudio==2.3.1
 demucs==4.0.1
-whisperx==3.1.5
+# PyAV is pulled in by faster-whisper (via whisperx). av 11.x has no cp311
+# manylinux wheel and only compiles against FFmpeg 6.0 headers, which is why the
+# source build failed with 'AV_OPT_TYPE_CHLAYOUT undeclared'. av 12.3.0 ships a
+# cp311 manylinux wheel with FFmpeg bundled — no compilation at all.
+av==12.3.0
+# whisperx 3.3.1 requires faster-whisper==1.1.0, whose av requirement is >=11,
+# so the pinned av 12.3.0 wheel satisfies it (3.1.5 hard-pinned av==11.*).
+faster-whisper==1.1.0
+whisperx==3.3.1

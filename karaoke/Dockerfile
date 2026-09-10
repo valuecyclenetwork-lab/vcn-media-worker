@@ -1,6 +1,12 @@
 # VCN Karaoke Worker — separate Railway service (vcn-karaoke-worker).
 # Models are baked into the image at build time: no live downloads at run time.
-FROM python:3.11-slim
+#
+# Base image is pinned to bookworm (glibc 2.36) on purpose. The floating
+# python:3.11-slim tag now resolves to Debian trixie (glibc >= 2.41), whose
+# loader rejects the CTranslate2 wheel with:
+#   ImportError: libctranslate2...so: cannot enable executable stack as shared
+#   object requires: Invalid argument
+FROM python:3.11-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -23,9 +29,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY requirements.txt .
 # CPU-only PyTorch keeps the image ~2.5 GB instead of ~7 GB.
-# --only-binary=av guarantees PyAV never falls back to a source build.
+# --only-binary=av,ctranslate2 guarantees neither falls back to a source build.
 RUN pip install --extra-index-url https://download.pytorch.org/whl/cpu \
-      --only-binary=av -r requirements.txt
+      --only-binary=av,ctranslate2 -r requirements.txt
+
+# Build-time smoke test: every heavy import must succeed BEFORE model baking.
+# No audio is downloaded or processed here.
+RUN python - <<'EOF'
+import platform
+print("glibc:", platform.libc_ver())
+import torch, torchaudio, ctranslate2, transformers, whisperx, demucs
+print("torch:", torch.__version__)
+print("torchaudio:", torchaudio.__version__)
+print("ctranslate2:", ctranslate2.__version__)
+print("transformers:", transformers.__version__)
+print("demucs:", getattr(demucs, "__version__", "4.0.1"))
+from transformers.utils import is_torch_available
+assert is_torch_available(), "Transformers disabled PyTorch — version mismatch"
+print("imports OK")
+EOF
 
 # Bake weights: Demucs htdemucs, faster-whisper "small", English wav2vec2 aligner.
 RUN python - <<'EOF'

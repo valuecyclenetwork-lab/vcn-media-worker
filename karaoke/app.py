@@ -72,7 +72,7 @@ FONT_CANDIDATES = [
 ]
 FONT_NAME = "DejaVu Sans"
 
-WORKER_VERSION = "2026-09-10.4-align2"
+WORKER_VERSION = "2026-09-10.5-align2"
 
 app = FastAPI(title="VCN Karaoke Worker")
 
@@ -757,14 +757,15 @@ async def _align_v2_only(kid: str, body: Dict[str, Any]) -> None:
     No Karaoke job, no Karaoke money, no render, no upload — and it shares no
     state with align-v1 beyond the loaded WhisperX runtime.
     """
-    import align_v2 as v2
-
     work = tempfile.mkdtemp(prefix="vcnv2_")
     diag: Dict[str, Any] = {"started_at": time.time(), "mode": "align_v2"}
     DIAGNOSTICS[kid] = diag
-    stage = "download"
+    stage = "import"
     _mark(diag, "job", "start")
     try:
+        import align_v2 as v2
+
+        stage = "download"
         JOBS[kid] = {"status": "PROCESSING", "stage": stage}
         src = os.path.join(work, "source.mp3")
         async with httpx.AsyncClient() as client:
@@ -815,7 +816,7 @@ async def _align_v2_only(kid: str, body: Dict[str, Any]) -> None:
                     "song_id": body.get("song_id"),
                     "callback_token": body.get("callback_token"),
                     "kind": "ALIGNMENT",
-                    "engine_version": v2.ENGINE_VERSION,
+                    "engine_version": "align-v2",
                     "status": "FAILED",
                     "error": err,
                 }, diag)
@@ -846,8 +847,11 @@ def _resources() -> Dict[str, Any]:
 
 
 async def _worker_loop() -> None:
+    """Never dies: one job's unexpected failure must not stop the queue."""
+    MODELS["loop_started_at"] = time.time()
     while True:
         kid, body = await QUEUE.get()
+        MODELS["loop_last_job"] = kid
         try:
             if body.get("_kind") == "align2":
                 await _align_v2_only(kid, body)
@@ -855,6 +859,9 @@ async def _worker_loop() -> None:
                 await _align_only(kid, body)
             else:
                 await _process(kid, body)
+        except BaseException as exc:  # noqa: BLE001 — keep the loop alive
+            log.error("worker loop caught %s for job %s: %s", type(exc).__name__, kid, _redact(str(exc))[:300])
+            JOBS[kid] = {"status": "FAILED", "stage": "worker", "error": _redact(str(exc))[:300]}
         finally:
             QUEUE.task_done()
 
@@ -872,6 +879,8 @@ async def health() -> Dict[str, Any]:
         "device": DEVICE, "whisper_model": WHISPER_MODEL, "demucs_model": DEMUCS_MODEL,
         "font": bool(_font()), "queue": QUEUE.qsize(),
         "engines": ["align-v1", "align-v2"],
+        "loop_started_at": MODELS.get("loop_started_at"),
+        "loop_last_job": MODELS.get("loop_last_job"),
         "align_v2_model": os.environ.get("KARAOKE_ALIGN_V2_MODEL", "medium"),
         "align_v2_separator": os.environ.get("KARAOKE_ALIGN_V2_SEPARATOR", "dsp"),
         "ffmpeg": shutil.which("ffmpeg") is not None,

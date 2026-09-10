@@ -70,6 +70,21 @@ def _pick_font() -> str:
 FONT = _pick_font()
 MAX_SKEW = 900
 
+WORKER_VERSION = "2026-09-10.5-premium-cover"
+
+
+def _ass_supported() -> bool:
+    """libass availability decides whether lyrics burn in as ASS or drawtext."""
+    try:
+        out = subprocess.run(["ffmpeg", "-hide_banner", "-filters"],
+                             capture_output=True, text=True, timeout=30)
+        return bool(re.search(r"^\s*\S*\s+ass\s", out.stdout or "", re.M))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+ASS_OK = _ass_supported()
+
 JOBS: Dict[str, Dict[str, Any]] = {}
 
 # Last failure diagnostics, keyed by render job id (in-memory, no secrets).
@@ -307,6 +322,203 @@ def _render(audio: str, cover: str, out: str, title: str, username: str,
         )
 
 
+# ------------------------------------------------- Full HD Lyrics Music Video
+# Additive mode. Reached ONLY when the caller supplies `art_url` (a native 16:9
+# landscape artwork). The classic square-cover recipe above is untouched.
+
+def _brand_graph(width: int, height: int, fps: int, title: str, username: str,
+                 tagline: str, art_idx: int, logo_idx: int, animate: bool) -> List[str]:
+    """
+    Deterministic VCN design layer over the landscape artwork:
+    logo (real asset) → song title → creator identity → optional tagline →
+    Full HD badge → reserved lyrics band across the bottom ~28%.
+    """
+    band_y = int(height * 0.72)
+    band_h = height - band_y
+    logo_w = int(width * 0.13)
+    over_w = int(width * 1.15)
+    over_h = int(height * 1.15)
+
+    art = (f"[{art_idx}:v]scale={over_w}:{over_h}:force_original_aspect_ratio=increase,"
+           f"crop={over_w}:{over_h},")
+    if animate:
+        art += (f"zoompan=z='min(max(zoom,pzoom)+0.00008,1.06)':"
+                f"x='iw/2-(iw/zoom/2)+sin(on/{fps * 12})*18':y='ih/2-(ih/zoom/2)':"
+                f"d=1:s={width}x{height}:fps={fps},")
+    else:
+        art += f"scale={width}:{height},"
+    art += "setsar=1[art]"
+
+    band = (f"[art]drawbox=x=0:y={band_y - 110}:w={width}:h=110:color=black@0.22:t=fill,"
+            f"drawbox=x=0:y={band_y}:w={width}:h={band_h}:color=black@0.60:t=fill,"
+            f"drawbox=x=0:y={band_y}:w={width}:h=3:color=0xE8B04B@0.85:t=fill[band]")
+
+    layers = [art, band,
+              f"[{logo_idx}:v]scale={logo_w}:-1[logo]",
+              f"[band][logo]overlay={width - logo_w - int(width * 0.033)}:{int(height * 0.045)}[branded]"]
+
+    x = int(width * 0.045)
+    texts: List[str] = []
+    if FONT:
+        def draw(text: str, y: int, size: int, colour: str) -> str:
+            return (f"drawtext=fontfile='{FONT}':text='{_esc(text)}':x={x}:y={y}:"
+                    f"fontsize={size}:fontcolor={colour}:"
+                    f"shadowcolor=black@0.7:shadowx=2:shadowy=2")
+
+        texts.append(draw(title or "Untitled", int(height * 0.055), int(height * 0.075), "white"))
+        texts.append(draw("Created by", int(height * 0.155), int(height * 0.026), "white@0.72"))
+        texts.append(draw(username or "", int(height * 0.190), int(height * 0.040), "0xE8B04B"))
+        if tagline:
+            texts.append(draw(tagline, int(height * 0.255), int(height * 0.028), "white@0.82"))
+        texts.append(
+            f"drawtext=fontfile='{FONT}':text='FULL HD 1080p':x={x}:y={band_y - 78}:"
+            f"fontsize={int(height * 0.022)}:fontcolor=white@0.75:box=1:"
+            f"boxcolor=black@0.45:boxborderw=10"
+        )
+    layers.append(f"[branded]{','.join(texts)}[design]" if texts else "[branded]null[design]")
+    return layers
+
+
+def _lyrics_text_layer(lines: List[Dict[str, Any]], width: int, height: int) -> str:
+    """drawtext fallback used only when this FFmpeg build has no libass."""
+    if not FONT or not lines:
+        return "[design]null[v]"
+    parts = []
+    for ln in lines[:160]:
+        start = float(ln.get("start", 0.0))
+        end = max(float(ln.get("end", start + 1.0)), start + 0.4)
+        parts.append(
+            f"drawtext=fontfile='{FONT}':text='{_esc(str(ln.get('text', '')))}':"
+            f"x=(w-text_w)/2:y={int(height * 0.795)}:fontsize={int(height * 0.055)}:"
+            f"fontcolor=white:shadowcolor=black@0.8:shadowx=2:shadowy=2:"
+            f"enable='between(t,{start:.2f},{end:.2f})'"
+        )
+    return f"[design]{','.join(parts)}[v]"
+
+
+def _render_clean_cover(art: str, logo: str, out_png: str, width: int, height: int,
+                        title: str, username: str, tagline: str,
+                        diagnostics: Optional[Dict[str, Any]] = None) -> None:
+    """One static PNG: the finished premium landscape design WITHOUT lyrics."""
+    layers = _brand_graph(width, height, 30, title, username, tagline, 0, 1, animate=False)
+    graph = ";".join(layers) + ";[design]null[v]"
+    cmd = ["ffmpeg", "-y", "-i", art, "-i", logo, "-filter_complex", graph,
+           "-map", "[v]", "-frames:v", "1", out_png]
+    proc = subprocess.run(cmd, capture_output=True)
+    stderr = (proc.stderr or b"").decode("utf-8", "replace")
+    if diagnostics is not None:
+        diagnostics["clean_cover_command"] = _safe_command(cmd)
+        diagnostics["clean_cover_rc"] = proc.returncode
+        diagnostics["clean_cover_bytes"] = os.path.getsize(out_png) if os.path.isfile(out_png) else 0
+    if proc.returncode != 0 or not os.path.isfile(out_png):
+        report = _stderr_report(stderr)
+        fatal = report["matched_error_lines"][-3:] or report["stderr_tail_150"][-3:]
+        raise RuntimeError("clean cover failed: " + " | ".join(fatal))
+
+
+def _render_lyrics_video(audio: str, art: str, logo: str, out: str, ass_path: Optional[str],
+                         lines: List[Dict[str, Any]], title: str, username: str, tagline: str,
+                         width: int, height: int, fps: int, duration: float,
+                         diagnostics: Optional[Dict[str, Any]] = None) -> None:
+    layers = _brand_graph(width, height, fps, title, username, tagline, 1, 2, animate=True)
+    if ass_path and ASS_OK:
+        safe = ass_path.replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
+        layers.append(f"[design]ass='{safe}'[v]")
+        lyric_method = "ass"
+    else:
+        layers.append(_lyrics_text_layer(lines, width, height))
+        lyric_method = "drawtext" if (lines and FONT) else "none"
+    graph = ";".join(layers)
+
+    cmd = ["ffmpeg", "-y",
+           "-i", audio, "-loop", "1", "-i", art, "-i", logo,
+           "-filter_complex", graph,
+           "-map", "[v]", "-map", "0:a",
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+           "-pix_fmt", "yuv420p", "-r", str(fps),
+           "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+           "-t", f"{duration:.3f}", "-shortest", "-movflags", "+faststart", out]
+
+    if diagnostics is not None:
+        diagnostics.update({
+            "mode": "lyrics_music_video",
+            "worker_version": WORKER_VERSION,
+            "lyric_method": lyric_method,
+            "ass_supported": ASS_OK,
+            "ffmpeg_command": _safe_command(cmd),
+            "filter_graph": graph,
+            "font_path": FONT or "(none — text overlay skipped)",
+            "logo_path": logo,
+            "audio_probe": _probe(audio),
+            "cover_probe": _probe(art),
+            "requested_duration": round(duration, 3),
+            "resolution": f"{width}x{height}",
+            "fps": fps,
+        })
+
+    started = time.time()
+    proc = subprocess.run(cmd, capture_output=True)
+    stderr = (proc.stderr or b"").decode("utf-8", "replace")
+    if diagnostics is not None:
+        diagnostics.update({
+            "return_code": proc.returncode,
+            "elapsed_seconds": round(time.time() - started, 2),
+            "killed_by_signal": proc.returncode < 0,
+            "output_exists": os.path.isfile(out),
+            "output_size_bytes": os.path.getsize(out) if os.path.isfile(out) else 0,
+            **_stderr_report(stderr),
+        })
+    if proc.returncode != 0:
+        report = _stderr_report(stderr)
+        fatal = report["matched_error_lines"][-4:] or report["stderr_tail_150"][-4:]
+        signal_note = (f" (killed by signal {-proc.returncode})" if proc.returncode < 0 else "")
+        raise RuntimeError(f"ffmpeg failed rc={proc.returncode}{signal_note}: " + " | ".join(fatal))
+
+
+async def _run_lyrics_job(client: httpx.AsyncClient, body: Dict[str, Any], work: str,
+                          out: str, diagnostics: Dict[str, Any]) -> float:
+    """Downloads, builds the clean cover, uploads it, then renders the video."""
+    audio = os.path.join(work, "a.mp3")
+    art = os.path.join(work, "art.jpg")
+    await _download(client, body["audio_url"], audio)
+    await _download(client, body["art_url"], art)
+    logo = LOGO_LIGHT if _mean_luma(art) < 110 else LOGO_DARK
+
+    width = int(body.get("width", 1920))
+    height = int(body.get("height", 1080))
+    fps = int(body.get("fps", 30))
+    title = body.get("title") or "Untitled"
+    username = body.get("creator_username") or ""
+    tagline = (body.get("tagline") or "")[:120]
+
+    # VCN no longer asks for a separate promotional cover: the song's Premium
+    # Music Cover (150 UC) is the official cover. Only render one when VCN
+    # explicitly supplies an upload target (legacy behaviour).
+    cover_png = os.path.join(work, "clean-cover.png")
+    if body.get("clean_cover_upload_url"):
+        await asyncio.to_thread(_render_clean_cover, art, logo, cover_png, width, height,
+                                title, username, tagline, diagnostics)
+        with open(cover_png, "rb") as fh:
+            up = await client.put(body["clean_cover_upload_url"], content=fh.read(),
+                                  headers={"Content-Type": "image/png"}, timeout=600)
+        diagnostics["clean_cover_upload"] = up.status_code
+        up.raise_for_status()
+
+    ass_path = None
+    if body.get("subtitles_ass"):
+        ass_path = os.path.join(work, "lyrics.ass")
+        with open(ass_path, "w", encoding="utf-8") as fh:
+            fh.write(str(body["subtitles_ass"]))
+
+    duration = _probe_duration(audio)
+    await asyncio.to_thread(
+        _render_lyrics_video, audio, art, logo, out, ass_path,
+        body.get("lyric_lines") or [], title, username, tagline,
+        width, height, fps, duration, diagnostics,
+    )
+    return duration
+
+
 async def _prepare_inputs(client: httpx.AsyncClient, body: Dict[str, Any], work: str):
     audio = os.path.join(work, "a.mp3")
     cover = os.path.join(work, "c.jpg")
@@ -322,16 +534,20 @@ async def _run_job(render_job_id: str, body: Dict[str, Any]) -> None:
     diagnostics: Dict[str, Any] = {"render_job_id": render_job_id}
     try:
         async with httpx.AsyncClient() as client:
-            audio, cover, logo = await _prepare_inputs(client, body, work)
-            duration = _probe_duration(audio)  # full song, never hardcoded
+            if body.get("art_url"):
+                # Full HD Lyrics Music Video (landscape artwork + synced lyrics).
+                duration = await _run_lyrics_job(client, body, work, out, diagnostics)
+            else:
+                audio, cover, logo = await _prepare_inputs(client, body, work)
+                duration = _probe_duration(audio)  # full song, never hardcoded
 
-            await asyncio.to_thread(
-                _render, audio, cover, out,
-                body.get("title") or "Untitled",
-                body.get("creator_username") or "",
-                int(body.get("width", 1920)), int(body.get("height", 1080)),
-                int(body.get("fps", 30)), duration, logo, diagnostics,
-            )
+                await asyncio.to_thread(
+                    _render, audio, cover, out,
+                    body.get("title") or "Untitled",
+                    body.get("creator_username") or "",
+                    int(body.get("width", 1920)), int(body.get("height", 1080)),
+                    int(body.get("fps", 30)), duration, logo, diagnostics,
+                )
 
             size = os.path.getsize(out)
             with open(out, "rb") as fh:
@@ -392,8 +608,10 @@ async def render_music_video(
     x_vcn_signature: Optional[str] = Header(None),
 ):
     body = await _verified_body(request, x_vcn_timestamp, x_vcn_signature)
-    for field in ("job_id", "audio_url", "cover_url", "upload_url", "callback_url",
-                  "callback_token"):
+    required = ["job_id", "audio_url", "upload_url", "callback_url", "callback_token"]
+    # Lyrics Music Video sends `art_url` (native 16:9); the classic recipe sends `cover_url`.
+    required.append("art_url" if body.get("art_url") else "cover_url")
+    for field in required:
         if not body.get(field):
             raise HTTPException(status_code=400, detail=f"Missing {field}")
 
@@ -471,4 +689,3 @@ async def diagnose(
         return diagnostics
     finally:
         shutil.rmtree(work, ignore_errors=True)
-

@@ -10,8 +10,23 @@ ENV PYTHONUNBUFFERED=1 \
     KARAOKE_DEVICE=cpu \
     KARAOKE_WHISPER_MODEL=small
 
+# Install system build dependencies required by PyAV, Demucs, WhisperX, and FFmpeg.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ffmpeg fonts-dejavu-core fonts-liberation libsndfile1 git \
+      pkg-config \
+      build-essential \
+      python3-dev \
+      ffmpeg \
+      libavformat-dev \
+      libavcodec-dev \
+      libavdevice-dev \
+      libavutil-dev \
+      libavfilter-dev \
+      libswscale-dev \
+      libswresample-dev \
+      fonts-dejavu-core \
+      fonts-liberation \
+      libsndfile1 \
+      git \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

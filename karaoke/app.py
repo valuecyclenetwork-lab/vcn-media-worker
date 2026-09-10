@@ -72,7 +72,7 @@ FONT_CANDIDATES = [
 ]
 FONT_NAME = "DejaVu Sans"
 
-WORKER_VERSION = "2026-09-10.3-align"
+WORKER_VERSION = "2026-09-10.4-align2"
 
 app = FastAPI(title="VCN Karaoke Worker")
 
@@ -220,6 +220,34 @@ def _load_models() -> None:
     MODELS["whisperx"] = whisperx
     MODELS["asr"] = whisperx.load_model(WHISPER_MODEL, DEVICE, compute_type=compute)
     MODELS["align_cache"] = {}
+
+
+def _v2_models() -> Dict[str, Any]:
+    """
+    Lazily provides the align-v2 model bundle. align-v2 uses a LARGER
+    recognition model than align-v1; if it cannot be loaded on this machine the
+    align-v1 model is reused so the engine still runs (recorded in diagnostics).
+    """
+    _load_models()
+    if "asr_v2" not in MODELS:
+        import align_v2 as _v2
+        whisperx = MODELS["whisperx"]
+        compute = "float16" if DEVICE == "cuda" else "int8"
+        try:
+            MODELS["asr_v2"] = whisperx.load_model(_v2.V2_WHISPER_MODEL, DEVICE, compute_type=compute)
+            MODELS["asr_v2_model"] = _v2.V2_WHISPER_MODEL
+        except Exception as exc:  # noqa: BLE001
+            log.warning("align-v2 model %s unavailable (%s); using %s",
+                        _v2.V2_WHISPER_MODEL, _redact(str(exc))[:120], _v2.V2_FALLBACK_MODEL)
+            MODELS["asr_v2"] = MODELS["asr"]
+            MODELS["asr_v2_model"] = _v2.V2_FALLBACK_MODEL
+    return {
+        "whisperx": MODELS["whisperx"],
+        "asr_v2": MODELS["asr_v2"],
+        "asr_v2_model": MODELS["asr_v2_model"],
+        "align_model": _align_model,
+        "device": DEVICE,
+    }
 
 
 def _align_model(language: str):
@@ -722,11 +750,108 @@ async def _align_only(kid: str, body: Dict[str, Any]) -> None:
         shutil.rmtree(work, ignore_errors=True)
 
 
+async def _align_v2_only(kid: str, body: Dict[str, Any]) -> None:
+    """
+    align-v2: ISOLATED improved timing engine (timing JSON only).
+
+    No Karaoke job, no Karaoke money, no render, no upload — and it shares no
+    state with align-v1 beyond the loaded WhisperX runtime.
+    """
+    import align_v2 as v2
+
+    work = tempfile.mkdtemp(prefix="vcnv2_")
+    diag: Dict[str, Any] = {"started_at": time.time(), "mode": "align_v2"}
+    DIAGNOSTICS[kid] = diag
+    stage = "download"
+    _mark(diag, "job", "start")
+    try:
+        JOBS[kid] = {"status": "PROCESSING", "stage": stage}
+        src = os.path.join(work, "source.mp3")
+        async with httpx.AsyncClient() as client:
+            _mark(diag, stage, "start")
+            await _download(client, body["audio_url"], src)
+            _mark(diag, stage, "end")
+            duration = _probe_duration(src)
+
+            stage = "align-v2"
+            JOBS[kid] = {"status": "PROCESSING", "stage": stage}
+            _mark(diag, stage, "start")
+            hint, reason = normalize_language_hint(body.get("language"))
+            diag["language_hint_used"] = hint
+            diag["language_hint_reason"] = reason
+            models = await asyncio.to_thread(_v2_models)
+            diag["v2_asr_model"] = models["asr_v2_model"]
+            timing = await asyncio.to_thread(
+                v2.time_lyrics_v2, models, work, src, body.get("lyrics") or "", hint, diag
+            )
+            timing["resources"] = _resources()
+            _mark(diag, stage, "end")
+
+            JOBS[kid] = {"status": "COMPLETED", "stage": "done", "timings": _timings(diag)}
+            _mark(diag, "callback", "start")
+            await _callback(client, body, {
+                "job_id": body["job_id"],
+                "song_id": body.get("song_id"),
+                "callback_token": body["callback_token"],
+                "kind": "ALIGNMENT",
+                "engine_version": v2.ENGINE_VERSION,
+                "schema_version": v2.SCHEMA_VERSION,
+                "model": v2.model_fingerprint(),
+                "status": "COMPLETED",
+                "duration_seconds": round(duration, 3),
+                "timing": timing,
+                "timings": _timings(diag),
+                "diagnostics": {k: v for k, v in diag.items() if str(k).startswith("v2_")},
+            }, diag)
+            _mark(diag, "callback", "end")
+    except Exception as exc:  # noqa: BLE001
+        err = _redact(f"{stage}: {exc}")[:400]
+        JOBS[kid] = {"status": "FAILED", "stage": stage, "error": err}
+        log.error("align-v2 job %s failed at %s: %s", kid, stage, err)
+        try:
+            async with httpx.AsyncClient() as client:
+                await _callback(client, body, {
+                    "job_id": body.get("job_id"),
+                    "song_id": body.get("song_id"),
+                    "callback_token": body.get("callback_token"),
+                    "kind": "ALIGNMENT",
+                    "engine_version": v2.ENGINE_VERSION,
+                    "status": "FAILED",
+                    "error": err,
+                }, diag)
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        _mark(diag, "job", "end")
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _resources() -> Dict[str, Any]:
+    """Best-effort CPU/RAM snapshot for diagnostics (never fails the job)."""
+    info: Dict[str, Any] = {"cpu_count": os.cpu_count()}
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmHWM"):
+                    info["peak_rss_kb"] = int(line.split()[1])
+                elif line.startswith("VmRSS"):
+                    info["rss_kb"] = int(line.split()[1])
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        info["load_avg"] = [round(v, 2) for v in os.getloadavg()]
+    except Exception:  # noqa: BLE001
+        pass
+    return info
+
+
 async def _worker_loop() -> None:
     while True:
         kid, body = await QUEUE.get()
         try:
-            if body.get("_kind") == "align":
+            if body.get("_kind") == "align2":
+                await _align_v2_only(kid, body)
+            elif body.get("_kind") == "align":
                 await _align_only(kid, body)
             else:
                 await _process(kid, body)
@@ -746,6 +871,9 @@ async def health() -> Dict[str, Any]:
         "ok": True, "service": "vcn-karaoke-worker", "version": WORKER_VERSION, "configured": bool(SECRET),
         "device": DEVICE, "whisper_model": WHISPER_MODEL, "demucs_model": DEMUCS_MODEL,
         "font": bool(_font()), "queue": QUEUE.qsize(),
+        "engines": ["align-v1", "align-v2"],
+        "align_v2_model": os.environ.get("KARAOKE_ALIGN_V2_MODEL", "medium"),
+        "align_v2_separator": os.environ.get("KARAOKE_ALIGN_V2_SEPARATOR", "dsp"),
         "ffmpeg": shutil.which("ffmpeg") is not None,
     }
 
@@ -782,6 +910,29 @@ async def align_lyrics(request: Request, x_vcn_timestamp: Optional[str] = Header
     await QUEUE.put((kid, body))
     return {"align_job_id": kid, "karaoke_job_id": kid, "status": "PENDING",
             "queue_position": QUEUE.qsize()}
+
+
+@app.post("/v1/align2")
+async def align_lyrics_v2(request: Request, x_vcn_timestamp: Optional[str] = Header(None),
+                          x_vcn_signature: Optional[str] = Header(None)) -> Dict[str, Any]:
+    """
+    align-v2 — ISOLATED improved timing engine (vocal-focused analysis +
+    whole-track recognition + global monotonic lyric matching). Same signed
+    security and queue as /v1/align, but a completely separate code path:
+    production align-v1 traffic is unaffected.
+    """
+    body = await _verified_body(request, x_vcn_timestamp, x_vcn_signature)
+    for f in ("job_id", "audio_url", "callback_url", "callback_token"):
+        if not body.get(f):
+            raise HTTPException(status_code=400, detail=f"Missing {f}")
+    if not str(body.get("lyrics") or "").strip():
+        raise HTTPException(status_code=400, detail="Missing lyrics")
+    body["_kind"] = "align2"
+    kid = f"a2_{uuid.uuid4().hex}"
+    JOBS[kid] = {"status": "PENDING", "stage": "queued", "position": QUEUE.qsize()}
+    await QUEUE.put((kid, body))
+    return {"align_job_id": kid, "karaoke_job_id": kid, "engine_version": "align-v2",
+            "status": "PENDING", "queue_position": QUEUE.qsize()}
 
 
 @app.post("/v1/job-status")

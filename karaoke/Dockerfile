@@ -10,29 +10,22 @@ ENV PYTHONUNBUFFERED=1 \
     KARAOKE_DEVICE=cpu \
     KARAOKE_WHISPER_MODEL=small
 
-# Install system build dependencies required by PyAV, Demucs, WhisperX, and FFmpeg.
+# Runtime dependencies only. PyAV is installed as a prebuilt wheel that bundles
+# its own FFmpeg libraries, so no libav*-dev headers and no C compilation are
+# needed. The `ffmpeg` binary is still required for the karaoke render step.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      pkg-config \
-      build-essential \
-      python3-dev \
       ffmpeg \
-      libavformat-dev \
-      libavcodec-dev \
-      libavdevice-dev \
-      libavutil-dev \
-      libavfilter-dev \
-      libswscale-dev \
-      libswresample-dev \
       fonts-dejavu-core \
       fonts-liberation \
       libsndfile1 \
-      git \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY requirements.txt .
 # CPU-only PyTorch keeps the image ~2.5 GB instead of ~7 GB.
-RUN pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
+# --only-binary=av guarantees PyAV never falls back to a source build.
+RUN pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+      --only-binary=av -r requirements.txt
 
 # Bake weights: Demucs htdemucs, faster-whisper "small", English wav2vec2 aligner.
 RUN python - <<'EOF'

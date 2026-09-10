@@ -26,3 +26,7 @@ av==12.3.0
 ctranslate2==4.4.0
 faster-whisper==1.1.0
 whisperx==3.3.1
+
+# WhisperX / pyannote.audio import paths pull in matplotlib at build-time smoke
+# test. Pin a stable Python 3.11-compatible release that does not force torch >=2.5.
+matplotlib==3.9.4

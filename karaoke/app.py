@@ -72,7 +72,7 @@ FONT_CANDIDATES = [
 ]
 FONT_NAME = "DejaVu Sans"
 
-WORKER_VERSION = "2026-09-10.5-align2"
+WORKER_VERSION = "2026-09-25.1-labelfix"
 
 app = FastAPI(title="VCN Karaoke Worker")
 
@@ -284,7 +284,7 @@ def _normalise_lyrics(text: str) -> List[str]:
         if not line:
             continue
         # drop section markers such as [Chorus], (Verse 2), **Bridge**
-        if re.fullmatch(r"[\[\(\*]+\s*[A-Za-z0-9 \-:']+\s*[\]\)\*]+", line):
+        if re.fullmatch(r"\s*(\[[^\]]*\]|\([^)]*\)|\*\*[^*]+\*\*)\s*", line):
             continue
         lines.append(line)
     return lines

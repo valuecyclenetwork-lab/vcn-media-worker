@@ -110,7 +110,7 @@ def normalise_lyric_lines(text: str) -> List[str]:
         line = raw.strip()
         if not line:
             continue
-        if re.fullmatch(r"[\[\(\*]+\s*[A-Za-z0-9 \-:']+\s*[\]\)\*]+", line):
+        if re.fullmatch(r"\s*(\[[^\]]*\]|\([^)]*\)|\*\*[^*]+\*\*)\s*", line):
             continue
         lines.append(line)
     return lines
